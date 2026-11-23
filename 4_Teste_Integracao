@@ -1,0 +1,150 @@
+public LivrosControllerTests()
+    {
+        _dbName = $"ChapterIntegrationDb_{Guid.NewGuid()}";
+
+        _server = new TestServer(
+            new WebHostBuilder()
+                .UseEnvironment("Development")
+                .UseStartup<Startup>()
+                .ConfigureServices(services =>
+                {
+                    services.RemoveAll(typeof(DbContextOptions<ChapterContext>));
+                    services.RemoveAll(typeof(ChapterContext));
+
+                    services.AddDbContext<ChapterContext>(options =>
+                        options.UseInMemoryDatabase(_dbName));
+                })
+        );
+
+        _client = _server.CreateClient();
+        PopularDadosIniciais();
+    }
+
+    private void PopularDadosIniciais()
+    {
+        using var scope = _server.Host.Services.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<ChapterContext>();
+
+        context.Livros.AddRange(
+            new Livro { Titulo = "Sylvester", QuantidadePaginas = 8, Disponivel = true },
+            new Livro { Titulo = "Whiskers", QuantidadePaginas = 2, Disponivel = true }
+        );
+
+        context.Usuarios.Add(new Usuario
+        {
+            Email = "admin@chapter.com",
+            Senha = "123"
+        });
+
+        context.SaveChanges();
+    }
+
+    [Fact]
+    public async Task Get_ListarLivros_DeveRetornar200OkComLista()
+    {
+        var response = await _client.GetAsync("/api/livros");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var json = await response.Content.ReadAsStringAsync();
+        var livros = JsonConvert.DeserializeObject<List<Livro>>(json);
+
+        Assert.NotNull(livros);
+        Assert.True(livros.Count >= 2);
+    }
+
+    [Fact]
+    public async Task Get_BuscarPorIdInexistente_DeveRetornar404NotFound()
+    {
+        var response = await _client.GetAsync("/api/livros/9999");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Post_Put_Delete_FluxoCompletoDeIntegracao_DeveExecutarComSucesso()
+    {
+        // 1. POST /api/livros (Criação)
+        var novoLivro = new Livro
+        {
+            Titulo = "Arquitetura Limpa",
+            QuantidadePaginas = 432,
+            Disponivel = true
+        };
+
+        var postContent = new StringContent(
+            JsonConvert.SerializeObject(novoLivro),
+            Encoding.UTF8,
+            "application/json");
+
+        var postResponse = await _client.PostAsync("/api/livros", postContent);
+        Assert.Equal(HttpStatusCode.Created, postResponse.StatusCode);
+
+        var criadoJson = await postResponse.Content.ReadAsStringAsync();
+        var livroCriado = JsonConvert.DeserializeObject<Livro>(criadoJson);
+        Assert.NotNull(livroCriado);
+        Assert.True(livroCriado.Id > 0);
+
+        // 2. GET /api/livros/{id} (Consulta do registro persistido no EF Core)
+        var getResponse = await _client.GetAsync($"/api/livros/{livroCriado.Id}");
+        Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
+
+        // 3. PUT /api/livros/{id} (Atualização)
+        livroCriado.Titulo = "Arquitetura Limpa - Edição Revisada";
+        livroCriado.Disponivel = false;
+
+        var putContent = new StringContent(
+            JsonConvert.SerializeObject(livroCriado),
+            Encoding.UTF8,
+            "application/json");
+
+        var putResponse = await _client.PutAsync($"/api/livros/{livroCriado.Id}", putContent);
+        Assert.Equal(HttpStatusCode.NoContent, putResponse.StatusCode);
+
+        // 4. DELETE /api/livros/{id} sem token -> deve retornar 401 Unauthorized
+        var deleteSemToken = await _client.DeleteAsync($"/api/livros/{livroCriado.Id}");
+        Assert.Equal(HttpStatusCode.Unauthorized, deleteSemToken.StatusCode);
+
+        // 5. POST /api/login para obter token JWT e autenticar o DELETE
+        var loginPayload = new StringContent(
+            JsonConvert.SerializeObject(new Usuario { Email = "admin@chapter.com", Senha = "123" }),
+            Encoding.UTF8,
+            "application/json");
+
+        var loginResponse = await _client.PostAsync("/api/login", loginPayload);
+        Assert.Equal(HttpStatusCode.OK, loginResponse.StatusCode);
+
+        var tokenObj = JsonConvert.DeserializeObject<Dictionary<string, string>>(
+            await loginResponse.Content.ReadAsStringAsync());
+
+        _client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", tokenObj["token"]);
+
+        var deleteComToken = await _client.DeleteAsync($"/api/livros/{livroCriado.Id}");
+        Assert.Equal(HttpStatusCode.NoContent, deleteComToken.StatusCode);
+
+        // 6. Confirma exclusão no banco
+        var getAposDelete = await _client.GetAsync($"/api/livros/{livroCriado.Id}");
+        Assert.Equal(HttpStatusCode.NotFound, getAposDelete.StatusCode);
+    }
+
+    [Fact]
+    public async Task Post_LivroInvalido_DeveRetornar400BadRequest()
+    {
+        var livroInvalido = new Livro { Titulo = "", QuantidadePaginas = 0 };
+        var content = new StringContent(
+            JsonConvert.SerializeObject(livroInvalido),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await _client.PostAsync("/api/livros", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    public void Dispose()
+    {
+        _client?.Dispose();
+        _server?.Dispose();
+    }
+}
